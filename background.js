@@ -176,158 +176,133 @@ class LanguageLearningBackground {
     }
 
     async processWordsFromTab(words, tabId, targetLanguage) {
-        // Create processing queue for this tab
-        if (!this.translationQueue.has(tabId)) {
-            this.translationQueue.set(tabId, []);
-        }
-        
-        const queue = this.translationQueue.get(tabId);
-        queue.push(...words);
+        // A new request supersedes words still queued from an earlier page load or settings change
+        this.translationQueue.set(tabId, {
+            words: [...words],
+            targetLanguage,
+            total: words.length,
+            processed: 0
+        });
         
         // Start processing if not already active for this tab
         if (!this.activeProcessing.has(tabId)) {
             this.activeProcessing.add(tabId);
-            await this.processQueueForTab(tabId, targetLanguage);
-            this.activeProcessing.delete(tabId);
+            try {
+                await this.processQueueForTab(tabId);
+            } finally {
+                this.activeProcessing.delete(tabId);
+                this.translationQueue.delete(tabId);
+            }
         }
     }
 
-    async processQueueForTab(tabId, targetLanguage) {
-        const queue = this.translationQueue.get(tabId);
-        if (!queue || queue.length === 0) return;
-
-        const totalWords = queue.length;
-        let processed = 0;
+    async processQueueForTab(tabId) {
+        let job = this.translationQueue.get(tabId);
+        if (!job || job.words.length === 0) return;
 
         // Send initial progress
-        this.sendProgressToTab(tabId, 'Processing words...', 0, totalWords);
-
-        // Get user overrides (blacklist and custom translations)
-        const [blacklistData, vocabularyData] = await Promise.all([
-            browser.storage.local.get('wordBlacklist'),
-            browser.storage.local.get('vocabulary')
-        ]);
+        this.sendProgressToTab(tabId, 'Processing words...', 0, job.total);
         
-        const blacklist = blacklistData.wordBlacklist || [];
-        const vocabulary = vocabularyData.vocabulary || {};
-        
-        // Process words in batches using server API
-        while (queue.length > 0) {
-            // Take a batch of words (up to 50 per request)
-            const batch = queue.splice(0, this.batchSize);
-            const wordsNeedingTranslation = [];
+        // Process words in batches using server API, picking up a replaced job between batches
+        while ((job = this.translationQueue.get(tabId)) && job.words.length > 0) {
+            const { targetLanguage } = job;
+            const batch = job.words.splice(0, this.batchSize);
             
-            // Process each word in the batch
+            // Get user overrides (blacklist and custom translations)
+            const { wordBlacklist: blacklist = [], vocabulary = {} } =
+                await browser.storage.local.get(['wordBlacklist', 'vocabulary']);
+            const cachedTranslations = await this.translationCache.getTranslations(
+                batch.map(wordObj => wordObj.text),
+                'auto',
+                targetLanguage
+            );
+            
+            const readyWords = [];
+            const wordsNeedingTranslation = [];
+            const vocabularyUpdates = [];
+            
             for (const wordObj of batch) {
                 const wordLower = wordObj.text.toLowerCase();
                 
-                // Check if word is blacklisted
-                if (blacklist.includes(wordLower)) {
-                    processed++;
-                    continue; // Skip blacklisted words entirely
-                }
+                // Skip blacklisted words entirely
+                if (blacklist.includes(wordLower)) continue;
                 
-                // Check if we have a custom translation
-                if (vocabulary[wordLower] && vocabulary[wordLower].translation) {
-                    // Use existing custom translation
-                    await this.sendTranslationToTab(tabId, {
-                        ...wordObj,
-                        translation: vocabulary[wordLower].translation
-                    });
-                    processed++;
+                // Use a custom translation the user set for this language
+                const vocabularyEntry = vocabulary[wordLower];
+                if (vocabularyEntry && vocabularyEntry.custom && vocabularyEntry.targetLanguage === targetLanguage) {
+                    readyWords.push({ ...wordObj, translation: vocabularyEntry.translation });
                     continue;
                 }
                 
-                // Check cache for existing translation (1-day expiry)
-                const cachedTranslation = await this.translationCache.getTranslation(
-                    wordObj.text, 
-                    'auto', 
-                    targetLanguage
-                );
-                
+                // Use cached translation (1-day expiry)
+                const cachedTranslation = cachedTranslations.get(wordLower);
                 if (cachedTranslation) {
-                    // Use cached translation
-                    await this.sendTranslationToTab(tabId, {
-                        ...wordObj,
-                        translation: cachedTranslation
-                    });
-                    
-                    // Also update vocabulary tracker
-                    await this.vocabularyTracker.addWord(wordObj.text, cachedTranslation);
-                    processed++;
+                    readyWords.push({ ...wordObj, translation: cachedTranslation });
+                    vocabularyUpdates.push([wordObj.text, cachedTranslation]);
                     continue;
                 }
                 
-                // Word needs server translation
                 wordsNeedingTranslation.push(wordObj);
             }
             
-            // Only send words to server that need translation
+            // Show known words right away instead of waiting for the server
+            await this.sendTranslationsToTab(tabId, readyWords);
+            
             if (wordsNeedingTranslation.length > 0) {
-                const wordTexts = wordsNeedingTranslation.map(word => word.text);
-                
                 try {
-                    // Send batch to server for translation
+                    const uniqueWordTexts = [...new Set(wordsNeedingTranslation.map(wordObj => wordObj.text))];
                     const translations = await this.serverAPI.translateWords(
-                        wordTexts,
+                        uniqueWordTexts,
                         'auto', // Auto-detect source language
                         targetLanguage,
                         this.settings.difficulty
                     );
                     
-                    // Process each translation result
+                    const translatedWords = [];
+                    const cacheEntries = [];
+                    
                     for (const translation of translations) {
+                        // Skip if translation is the same as original word
+                        if (translation.translated_word.toLowerCase().trim() === translation.original_word.toLowerCase().trim()) continue;
+                        
                         // Find every occurrence of this word in the batch
                         const matchingWordObjs = wordsNeedingTranslation.filter(w => w.text === translation.original_word);
                         if (matchingWordObjs.length === 0) continue;
                         
-                        // Skip if translation is the same as original word
-                        if (translation.translated_word.toLowerCase().trim() !== translation.original_word.toLowerCase().trim()) {
-                            // Cache the translation for 1 day
-                            await this.translationCache.setTranslation(
-                                translation.original_word,
-                                'auto',
-                                targetLanguage,
-                                translation.translated_word
-                            );
-                            
-                            // Send translation result to content script
-                            for (const wordObj of matchingWordObjs) {
-                                await this.sendTranslationToTab(tabId, {
-                                    ...wordObj,
-                                    translation: translation.translated_word
-                                });
-                            }
-                            
-                            // Track vocabulary locally
-                            await this.vocabularyTracker.addWord(translation.original_word, translation.translated_word);
-                        }
+                        matchingWordObjs.forEach(wordObj =>
+                            translatedWords.push({ ...wordObj, translation: translation.translated_word }));
+                        cacheEntries.push([translation.original_word, translation.translated_word]);
+                        vocabularyUpdates.push([translation.original_word, translation.translated_word]);
                     }
                     
-                    processed += wordsNeedingTranslation.length;
-                    
+                    await this.sendTranslationsToTab(tabId, translatedWords);
+                    await this.translationCache.setTranslations(cacheEntries, 'auto', targetLanguage);
                 } catch (error) {
                     console.error('Batch translation error:', error);
                     // Skip this batch and continue
-                    processed += wordsNeedingTranslation.length;
                 }
             }
             
+            await this.vocabularyTracker.addWords(vocabularyUpdates);
+            
             // Send progress updates
-            this.sendProgressToTab(tabId, `Processing words... ${processed}/${totalWords}`, processed, totalWords);
+            job.processed += batch.length;
+            this.sendProgressToTab(tabId, `Processing words... ${job.processed}/${job.total}`, job.processed, job.total);
         }
 
         // Send completion
+        const total = this.translationQueue.get(tabId)?.total || 0;
         setTimeout(() => {
-            this.sendProgressToTab(tabId, 'Ready', totalWords, totalWords);
+            this.sendProgressToTab(tabId, 'Ready', total, total);
         }, 100);
     }
 
-    async sendTranslationToTab(tabId, wordData) {
+    async sendTranslationsToTab(tabId, words) {
+        if (words.length === 0) return;
         try {
             await browser.tabs.sendMessage(tabId, {
-                action: 'translationReady',
-                wordData: wordData
+                action: 'translationsReady',
+                words
             });
         } catch (error) {
             // Tab might be closed or navigated away, that's fine
@@ -392,7 +367,7 @@ class LanguageLearningBackground {
     
     async setCustomTranslation(word, translation) {
         // Update vocabulary with custom translation
-        await this.vocabularyTracker.addWord(word, translation);
+        await this.vocabularyTracker.addWord(word, translation, this.settings.targetLanguage);
     }
     
     async blacklistWord(word) {
@@ -426,20 +401,36 @@ class VocabularyTracker {
         }
     }
 
-    async addWord(original, translation) {
-        const key = original.toLowerCase();
-        this.vocabulary.set(key, {
-            original,
-            translation,
-            encounters: (this.vocabulary.get(key)?.encounters || 0) + 1,
-            firstSeen: this.vocabulary.get(key)?.firstSeen || Date.now(),
-            lastSeen: Date.now()
-        });
-        
+    // customLanguage marks the translation as the user's own correction for that language
+    async addWords(pairs, customLanguage = null) {
+        if (pairs.length === 0) return;
+        await this.loadVocabulary(); // Pick up edits made from the popup so they aren't overwritten
+
+        const now = Date.now();
+        for (const [original, translation] of pairs) {
+            const key = original.toLowerCase();
+            const existing = this.vocabulary.get(key);
+            const keepCustomTranslation = existing?.custom && !customLanguage;
+            this.vocabulary.set(key, {
+                ...existing,
+                original,
+                translation: keepCustomTranslation ? existing.translation : translation,
+                encounters: (existing?.encounters || 0) + 1,
+                firstSeen: existing?.firstSeen || now,
+                lastSeen: now,
+                ...(customLanguage && { custom: true, targetLanguage: customLanguage })
+            });
+        }
+
         await this.saveVocabulary();
     }
 
+    async addWord(original, translation, customLanguage = null) {
+        await this.addWords([[original, translation]], customLanguage);
+    }
+
     async markWordAsLearned(word) {
+        await this.loadVocabulary();
         this.learnedWords.add(word.toLowerCase());
         await this.saveVocabulary();
     }
@@ -476,58 +467,47 @@ class TranslationCache {
         return `${originalWord.toLowerCase().trim()}|${sourceLanguage}|${targetLanguage}`;
     }
 
-    // Get translation from cache if not expired
-    async getTranslation(originalWord, sourceLanguage, targetLanguage) {
+    // Get unexpired cached translations for many words with a single storage read
+    async getTranslations(originalWords, sourceLanguage, targetLanguage) {
+        const translations = new Map();
         try {
             const stored = await browser.storage.local.get(this.CACHE_KEY);
             const cache = stored[this.CACHE_KEY] || {};
             
-            const key = this.getCacheKey(originalWord, sourceLanguage, targetLanguage);
-            const entry = cache[key];
-            
-            if (!entry) {
-                return null; // No cached translation
-            }
-            
-            // Check if cache entry has expired (1 day = 24 * 60 * 60 * 1000 ms)
             const now = Date.now();
-            const expiryTime = entry.timestamp + (this.CACHE_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+            const expiryThreshold = this.CACHE_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
             
-            if (now > expiryTime) {
-                // Cache entry expired, remove it
-                delete cache[key];
-                await browser.storage.local.set({ [this.CACHE_KEY]: cache });
-                return null;
+            for (const originalWord of originalWords) {
+                const entry = cache[this.getCacheKey(originalWord, sourceLanguage, targetLanguage)];
+                if (entry && now - entry.timestamp <= expiryThreshold) {
+                    translations.set(originalWord.toLowerCase(), entry.translation);
+                }
             }
-            
-            console.log(`Cache hit for "${originalWord}" -> "${entry.translation}"`);
-            return entry.translation;
-            
         } catch (error) {
             console.error('Error reading from translation cache:', error);
-            return null;
         }
+        return translations;
     }
 
-    // Set translation in cache with current timestamp
-    async setTranslation(originalWord, sourceLanguage, targetLanguage, translation) {
+    // Save many [originalWord, translation] pairs with a single storage write
+    async setTranslations(entries, sourceLanguage, targetLanguage) {
+        if (entries.length === 0) return;
         try {
             const stored = await browser.storage.local.get(this.CACHE_KEY);
             const cache = stored[this.CACHE_KEY] || {};
+            const timestamp = Date.now();
             
-            const key = this.getCacheKey(originalWord, sourceLanguage, targetLanguage);
-            
-            cache[key] = {
-                translation: translation,
-                timestamp: Date.now(),
-                originalWord: originalWord,
-                sourceLanguage: sourceLanguage,
-                targetLanguage: targetLanguage
-            };
+            for (const [originalWord, translation] of entries) {
+                cache[this.getCacheKey(originalWord, sourceLanguage, targetLanguage)] = {
+                    translation,
+                    timestamp,
+                    originalWord,
+                    sourceLanguage,
+                    targetLanguage
+                };
+            }
             
             await browser.storage.local.set({ [this.CACHE_KEY]: cache });
-            console.log(`Cached translation: "${originalWord}" -> "${translation}"`);
-            
         } catch (error) {
             console.error('Error saving to translation cache:', error);
         }

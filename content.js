@@ -1,3 +1,6 @@
+const SPEECH_IDLE_MS = 3000; // After this long without speech the audio output may have gone to sleep
+const SPEECH_RESTART_DELAY_MS = 100;
+
 class LanguageLearningContent {
     constructor() {
         this.isEnabled = false;
@@ -11,6 +14,10 @@ class LanguageLearningContent {
         this.isTooltipHovered = false; // Track tooltip hover state
         this.hideTooltipTimeout = null; // Track hide timeout
         this.dictionary = new EnglishDictionary(); // English word dictionary for filtering
+        this.speechVoices = []; // Voices installed on the system, filled once the browser reports them
+        this.lastSpeechAt = 0; // When audio output was last active, to know if it needs waking up
+        this.speakTimeout = null;
+        this.currentUtterance = null; // Held so the utterance isn't garbage collected while speaking
         
         this.init();
     }
@@ -152,6 +159,7 @@ class LanguageLearningContent {
         
         await this.loadSettings();
         this.createTooltip();
+        this.setupSpeech();
         
         if (this.isEnabled) {
             this.processPage();
@@ -194,8 +202,8 @@ class LanguageLearningContent {
                 case 'getStats':
                     sendResponse(this.getStats());
                     break;
-                case 'translationReady':
-                    this.handleTranslationReady(request.wordData);
+                case 'translationsReady':
+                    request.words.forEach(wordData => this.handleTranslationReady(wordData));
                     sendResponse({success: true});
                     break;
                 default:
@@ -576,16 +584,62 @@ class LanguageLearningContent {
         return svg;
     }
 
-    speakTranslation(text, language) {
-        const synth = window.speechSynthesis;
-        synth.cancel(); // Stop any word still being spoken
+    setupSpeech() {
+        if (!('speechSynthesis' in window)) return;
 
+        // Firefox can report an empty voice list until voiceschanged fires
+        const loadVoices = () => {
+            this.speechVoices = window.speechSynthesis.getVoices();
+        };
+        loadVoices();
+        window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+    }
+
+    createUtterance(text, language, volume = 1) {
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.lang = language;
-        const voice = synth.getVoices().find(v => v.lang.toLowerCase().startsWith(language.toLowerCase()));
+        utterance.volume = volume;
+
+        const voice = this.speechVoices.find(v => v.lang.toLowerCase().startsWith(language.toLowerCase()));
         if (voice) utterance.voice = voice;
 
-        synth.speak(utterance);
+        utterance.addEventListener('end', () => {
+            this.lastSpeechAt = Date.now();
+        });
+        return utterance;
+    }
+
+    isSpeechOutputIdle() {
+        const synth = window.speechSynthesis;
+        return !synth.speaking && !synth.pending && Date.now() - this.lastSpeechAt > SPEECH_IDLE_MS;
+    }
+
+    // The audio output sleeps when idle and clips the first sound while waking, so play the word silently first
+    primeSpeech(text, language) {
+        if (!this.isSpeechOutputIdle()) return;
+        this.lastSpeechAt = Date.now();
+        window.speechSynthesis.speak(this.createUtterance(text, language, 0));
+    }
+
+    speakTranslation(text, language) {
+        const synth = window.speechSynthesis;
+        clearTimeout(this.speakTimeout);
+
+        const speak = () => {
+            this.speakTimeout = null;
+            this.primeSpeech(text, language);
+            this.currentUtterance = this.createUtterance(text, language);
+            this.lastSpeechAt = Date.now();
+            synth.speak(this.currentUtterance);
+        };
+
+        if (this.speakTimeout || synth.speaking || synth.pending) {
+            synth.cancel();
+            // Engines drop an utterance queued in the same tick as cancel()
+            this.speakTimeout = setTimeout(speak, SPEECH_RESTART_DELAY_MS);
+        } else {
+            speak();
+        }
     }
 
     showTooltip(event, originalWord, translation, language, pinned = false) {
@@ -627,6 +681,7 @@ class LanguageLearningContent {
             speakBtn.setAttribute('data-translation', translation);
             speakBtn.setAttribute('data-language', language);
             actionsDiv.appendChild(speakBtn);
+            this.primeSpeech(translation, language);
         }
 
         // Create learned button
