@@ -180,6 +180,28 @@
     text-wrap: nowrap;
 }
 
+.tooltip-btn.speak-btn {
+    background: rgba(70, 130, 180, 0.8);
+    color: white;
+    border-radius: 50px;
+    padding: 5px 5px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.tooltip-btn.speak-btn:hover {
+    background: rgba(70, 130, 180, 1);
+    transform: translateY(-1px);
+}
+
+.tooltip-btn.speak-btn:hover::after {
+    content: "Listen";
+    overflow: hidden;
+    margin-left: 2px;
+    text-wrap: nowrap;
+}
+
 .fluent-extension-icon {
     display: inline-block;
     vertical-align: middle;

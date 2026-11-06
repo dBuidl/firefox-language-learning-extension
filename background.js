@@ -277,9 +277,9 @@ class LanguageLearningBackground {
                     
                     // Process each translation result
                     for (const translation of translations) {
-                        // Find corresponding word object
-                        const wordObj = wordsNeedingTranslation.find(w => w.text === translation.original_word);
-                        if (!wordObj) continue;
+                        // Find every occurrence of this word in the batch
+                        const matchingWordObjs = wordsNeedingTranslation.filter(w => w.text === translation.original_word);
+                        if (matchingWordObjs.length === 0) continue;
                         
                         // Skip if translation is the same as original word
                         if (translation.translated_word.toLowerCase().trim() !== translation.original_word.toLowerCase().trim()) {
@@ -292,10 +292,12 @@ class LanguageLearningBackground {
                             );
                             
                             // Send translation result to content script
-                            await this.sendTranslationToTab(tabId, {
-                                ...wordObj,
-                                translation: translation.translated_word
-                            });
+                            for (const wordObj of matchingWordObjs) {
+                                await this.sendTranslationToTab(tabId, {
+                                    ...wordObj,
+                                    translation: translation.translated_word
+                                });
+                            }
                             
                             // Track vocabulary locally
                             await this.vocabularyTracker.addWord(translation.original_word, translation.translated_word);
