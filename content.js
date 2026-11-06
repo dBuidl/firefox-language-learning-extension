@@ -1,3 +1,6 @@
+const SPEECH_IDLE_MS = 3000; // After this long without speech the audio output may have gone to sleep
+const SPEECH_RESTART_DELAY_MS = 100;
+
 class LanguageLearningContent {
     constructor() {
         this.isEnabled = false;
@@ -7,9 +10,14 @@ class LanguageLearningContent {
         this.processedWords = new Set();
         this.tooltip = null;
         this.pendingReplacements = new Map(); // Store nodes waiting for translations
+        this.nodeSegments = new WeakMap(); // Original text node -> text pieces left after earlier replacements
         this.isTooltipHovered = false; // Track tooltip hover state
         this.hideTooltipTimeout = null; // Track hide timeout
         this.dictionary = new EnglishDictionary(); // English word dictionary for filtering
+        this.speechVoices = []; // Voices installed on the system, filled once the browser reports them
+        this.lastSpeechAt = 0; // When audio output was last active, to know if it needs waking up
+        this.speakTimeout = null;
+        this.currentUtterance = null; // Held so the utterance isn't garbage collected while speaking
         
         this.init();
     }
@@ -151,6 +159,7 @@ class LanguageLearningContent {
         
         await this.loadSettings();
         this.createTooltip();
+        this.setupSpeech();
         
         if (this.isEnabled) {
             this.processPage();
@@ -193,8 +202,8 @@ class LanguageLearningContent {
                 case 'getStats':
                     sendResponse(this.getStats());
                     break;
-                case 'translationReady':
-                    this.handleTranslationReady(request.wordData);
+                case 'translationsReady':
+                    request.words.forEach(wordData => this.handleTranslationReady(wordData));
                     sendResponse({success: true});
                     break;
                 default:
@@ -233,18 +242,12 @@ class LanguageLearningContent {
             return;
         }
         
-        // Store pending replacements for when translations come back
-        wordsToProcess.forEach(({ node, word, index }) => {
-            const key = `${word.toLowerCase()}_${Date.now()}_${Math.random()}`;
-            this.pendingReplacements.set(key, { node, word, index });
+        // Store pending replacements under the same id the background echoes back
+        const wordsData = wordsToProcess.map(({ node, word, index }) => {
+            const id = `${word.toLowerCase()}_${Date.now()}_${Math.random()}`;
+            this.pendingReplacements.set(id, { node, word, index });
+            return { text: word, index, id };
         });
-        
-        // Send words to background for processing
-        const wordsData = wordsToProcess.map(({ word, index }) => ({
-            text: word,
-            index: index,
-            id: `${word.toLowerCase()}_${Date.now()}_${Math.random()}`
-        }));
         
         try {
             await browser.runtime.sendMessage({
@@ -274,7 +277,12 @@ class LanguageLearningContent {
                     if (parent.isContentEditable) {
                         return NodeFilter.FILTER_REJECT;
                     }
-                    
+
+                    // Never translate the extension's own tooltip or modal
+                    if (parent.closest('.language-learning-tooltip, #fluent-tab-modal')) {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+
                     return node.textContent.trim().length > 0 ? 
                         NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
                 }
@@ -292,6 +300,8 @@ class LanguageLearningContent {
 
     async selectWordsForReplacement(textNodes) {
         const wordsToProcess = [];
+        const { wordBlacklist = [], learnedWords = [] } = await browser.storage.local.get(['wordBlacklist', 'learnedWords']);
+        const excludedWords = new Set([...wordBlacklist, ...learnedWords]);
         
         for (const node of textNodes) {
             const text = node.textContent;
@@ -308,11 +318,12 @@ class LanguageLearningContent {
             
             // Always include single words (including contractions)
             // Find all word matches with their positions
+            // Unicode-aware boundaries so "Zürich" or "résumé" never yield partial matches like "rich" or "sum"
             let match;
-            const wordRegex = /\b[a-zA-Z]+(?:'[a-zA-Z]+)?\b/g;
+            const wordRegex = /(?<![\p{L}\p{M}\p{N}_])[a-zA-Z]+(?:'[a-zA-Z]+)?(?![\p{L}\p{M}\p{N}_])/gu;
             while ((match = wordRegex.exec(text)) !== null) {
                 const word = match[0];
-                if (await this.shouldReplaceWord(word)) {
+                if (this.shouldReplaceWord(word, excludedWords)) {
                     const index = match.index;
                     wordsToProcess.push({ node, word, index });
                 }
@@ -360,7 +371,7 @@ class LanguageLearningContent {
         return !this.processedWords.has(phrase.toLowerCase());
     }
     
-    async shouldReplaceWord(word) {
+    shouldReplaceWord(word, excludedWords) {
         if (word.length < 3 || word.length > 20) return false; // Increased length limit for contractions
         if (this.processedWords.has(word.toLowerCase())) return false;
         
@@ -369,13 +380,8 @@ class LanguageLearningContent {
             return false; // Filter out words not in dictionary
         }
         
-        // Check if word has been marked as learned
-        const stored = await browser.storage.local.get(['wordBlacklist', 'learnedWords']);
-        const blacklist = stored.wordBlacklist || [];
-        const learnedWords = stored.learnedWords || [];
-        
-        if (blacklist.includes(word.toLowerCase())) return false;
-        if (learnedWords.includes(word.toLowerCase())) return false;
+        // Skip blacklisted or learned words
+        if (excludedWords.has(word.toLowerCase())) return false;
         
         // Skip very common words that shouldn't be translated for learning
         const commonWords = {
@@ -388,16 +394,13 @@ class LanguageLearningContent {
     }
 
     handleTranslationReady(wordData) {
-        // Find the matching pending replacement
-        const pendingKey = Array.from(this.pendingReplacements.keys())
-            .find(key => key.startsWith(wordData.text.toLowerCase()));
-        
-        if (!pendingKey) {
+        const pending = this.pendingReplacements.get(wordData.id);
+        if (!pending) {
             return; // No matching pending replacement
         }
         
-        const { node, word, index } = this.pendingReplacements.get(pendingKey);
-        this.pendingReplacements.delete(pendingKey);
+        const { node, word, index } = pending;
+        this.pendingReplacements.delete(wordData.id);
         
         // Create the word replacement
         this.createWordReplacement(node, word, { text: wordData.translation }, index);
@@ -405,21 +408,21 @@ class LanguageLearningContent {
     }
 
     createWordReplacement(node, originalWord, translation, index) {
-        // Check if node is still in DOM and has a parent
-        if (!node || !node.parentNode || !document.contains(node)) {
-            return;
+        // A text node is split on every replacement, so find the remaining piece that still holds this word
+        const segments = this.nodeSegments.get(node) || [{ node, start: 0 }];
+        const end = index + originalWord.length;
+        const segmentIndex = segments.findIndex(segment =>
+            index >= segment.start && end <= segment.start + segment.node.length);
+        
+        if (segmentIndex === -1) {
+            return; // Overlaps a word that was already replaced
         }
         
-        const text = node.textContent;
-        const beforeText = text.substring(0, index);
-        const afterText = text.substring(index + originalWord.length);
-        
-        // Create a document fragment to hold the new structure
-        const fragment = document.createDocumentFragment();
-        
-        // Add text before the word
-        if (beforeText) {
-            fragment.appendChild(document.createTextNode(beforeText));
+        const segment = segments[segmentIndex];
+        const offset = index - segment.start;
+        if (!segment.node.parentNode || !document.contains(segment.node) ||
+            segment.node.data.slice(offset, offset + originalWord.length) !== originalWord) {
+            return; // Node removed or its text changed since it was scanned
         }
         
         // Create the translated span
@@ -434,28 +437,26 @@ class LanguageLearningContent {
         
         this.setupWordEvents(translatedSpan, originalWord, translation.text);
         
-        fragment.appendChild(translatedSpan);
-        
-        // Add text after the word
-        if (afterText) {
-            fragment.appendChild(document.createTextNode(afterText));
-        }
-        
         try {
-            // Replace the text node with the fragment containing the span
-            if (node.parentNode && document.contains(node)) {
-                node.parentNode.replaceChild(fragment, node);
-            }
+            const wordNode = segment.node.splitText(offset);
+            const afterNode = wordNode.splitText(originalWord.length);
+            wordNode.parentNode.replaceChild(translatedSpan, wordNode);
+            segments.splice(segmentIndex, 1,
+                { node: segment.node, start: segment.start },
+                { node: afterNode, start: end });
+            this.nodeSegments.set(node, segments);
         } catch (error) {
             // Silently handle DOM manipulation errors
         }
     }
 
     setupWordEvents(element, originalWord, translation) {
+        const language = this.targetLanguage; // Language the word was translated into
+        
         element.addEventListener('mouseenter', (e) => {
             // Only show hover tooltip if no tooltip is currently pinned
             if (!this.tooltip.classList.contains('pinned')) {
-                this.showTooltip(e, originalWord, translation, false);
+                this.showTooltip(e, originalWord, translation, language, false);
             }
         });
         
@@ -481,7 +482,7 @@ class LanguageLearningContent {
             // Prevent default and show pinned tooltip
             e.preventDefault();
             e.stopPropagation();
-            this.showTooltip(e, originalWord, translation, true);
+            this.showTooltip(e, originalWord, translation, language, true);
         });
     }
 
@@ -489,6 +490,24 @@ class LanguageLearningContent {
         this.tooltip = document.createElement('div');
         this.tooltip.className = 'language-learning-tooltip';
         document.body.appendChild(this.tooltip);
+        
+        // Add hover events to tooltip itself for better UX
+        this.tooltip.addEventListener('mouseenter', () => {
+            this.isTooltipHovered = true;
+            // Cancel any pending hide timeout
+            if (this.hideTooltipTimeout) {
+                clearTimeout(this.hideTooltipTimeout);
+                this.hideTooltipTimeout = null;
+            }
+        });
+        
+        this.tooltip.addEventListener('mouseleave', () => {
+            this.isTooltipHovered = false;
+            // Hide tooltip when leaving it (unless pinned)
+            if (!this.tooltip.classList.contains('pinned')) {
+                this.hideTooltip();
+            }
+        });
         
         // Add global click listener to close pinned tooltips
         document.addEventListener('click', (e) => {
@@ -538,7 +557,92 @@ class LanguageLearningContent {
         return svg;
     }
 
-    showTooltip(event, originalWord, translation, pinned = false) {
+    createSpeakerSVG() {
+        // Lucide "volume-2" icon - https://lucide.dev License - ISC
+        const svgNS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('xmlns', svgNS);
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('width', '18');
+        svg.setAttribute('height', '18');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', 'white');
+        svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+
+        const speaker = document.createElementNS(svgNS, 'polygon');
+        speaker.setAttribute('points', '11 5 6 9 2 9 2 15 6 15 11 19 11 5');
+        svg.appendChild(speaker);
+
+        ['M15.54 8.46a5 5 0 0 1 0 7.07', 'M19.07 4.93a10 10 0 0 1 0 14.14'].forEach(d => {
+            const wave = document.createElementNS(svgNS, 'path');
+            wave.setAttribute('d', d);
+            svg.appendChild(wave);
+        });
+
+        return svg;
+    }
+
+    setupSpeech() {
+        if (!('speechSynthesis' in window)) return;
+
+        // Firefox can report an empty voice list until voiceschanged fires
+        const loadVoices = () => {
+            this.speechVoices = window.speechSynthesis.getVoices();
+        };
+        loadVoices();
+        window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+    }
+
+    createUtterance(text, language, volume = 1) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = language;
+        utterance.volume = volume;
+
+        const voice = this.speechVoices.find(v => v.lang.toLowerCase().startsWith(language.toLowerCase()));
+        if (voice) utterance.voice = voice;
+
+        utterance.addEventListener('end', () => {
+            this.lastSpeechAt = Date.now();
+        });
+        return utterance;
+    }
+
+    isSpeechOutputIdle() {
+        const synth = window.speechSynthesis;
+        return !synth.speaking && !synth.pending && Date.now() - this.lastSpeechAt > SPEECH_IDLE_MS;
+    }
+
+    // The audio output sleeps when idle and clips the first sound while waking, so play the word silently first
+    primeSpeech(text, language) {
+        if (!this.isSpeechOutputIdle()) return;
+        this.lastSpeechAt = Date.now();
+        window.speechSynthesis.speak(this.createUtterance(text, language, 0));
+    }
+
+    speakTranslation(text, language) {
+        const synth = window.speechSynthesis;
+        clearTimeout(this.speakTimeout);
+
+        const speak = () => {
+            this.speakTimeout = null;
+            this.primeSpeech(text, language);
+            this.currentUtterance = this.createUtterance(text, language);
+            this.lastSpeechAt = Date.now();
+            synth.speak(this.currentUtterance);
+        };
+
+        if (this.speakTimeout || synth.speaking || synth.pending) {
+            synth.cancel();
+            // Engines drop an utterance queued in the same tick as cancel()
+            this.speakTimeout = setTimeout(speak, SPEECH_RESTART_DELAY_MS);
+        } else {
+            speak();
+        }
+    }
+
+    showTooltip(event, originalWord, translation, language, pinned = false) {
         const rect = event.target.getBoundingClientRect();
         
         // Clear tooltip content
@@ -567,6 +671,18 @@ class LanguageLearningContent {
         extensionIcon.style.alignSelf = 'center';
         actionsDiv.appendChild(extensionIcon);
 
+        // Create listen button (only where the browser supports speech synthesis)
+        if ('speechSynthesis' in window) {
+            const speakBtn = document.createElement('button');
+            speakBtn.className = 'tooltip-btn speak-btn';
+            speakBtn.appendChild(this.createSpeakerSVG());
+            speakBtn.setAttribute('aria-label', 'Listen');
+            speakBtn.setAttribute('data-action', 'speak');
+            speakBtn.setAttribute('data-translation', translation);
+            speakBtn.setAttribute('data-language', language);
+            actionsDiv.appendChild(speakBtn);
+            this.primeSpeech(translation, language);
+        }
 
         // Create learned button
         const learnedBtn = document.createElement('button');
@@ -609,26 +725,10 @@ class LanguageLearningContent {
                 } else if (action === 'incorrect') {
                     this.handleIncorrectTranslation(word, trans);
                     this.hideTooltip();
+                } else if (action === 'speak') {
+                    this.speakTranslation(trans, btn.dataset.language);
                 }
             });
-        });
-        
-        // Add hover events to tooltip itself for better UX
-        this.tooltip.addEventListener('mouseenter', () => {
-            this.isTooltipHovered = true;
-            // Cancel any pending hide timeout
-            if (this.hideTooltipTimeout) {
-                clearTimeout(this.hideTooltipTimeout);
-                this.hideTooltipTimeout = null;
-            }
-        });
-        
-        this.tooltip.addEventListener('mouseleave', () => {
-            this.isTooltipHovered = false;
-            // Hide tooltip when leaving it (unless pinned)
-            if (!this.tooltip.classList.contains('pinned')) {
-                this.hideTooltip();
-            }
         });
         
         // Reset base classes but preserve pinned state
@@ -702,6 +802,8 @@ class LanguageLearningContent {
         });
         
         this.processedWords.clear();
+        this.pendingReplacements.clear(); // Drop translations still in flight so they don't land after disabling
+        this.nodeSegments = new WeakMap();
     }
 
     shuffleArray(array) {

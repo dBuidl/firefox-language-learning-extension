@@ -655,6 +655,8 @@ class LanguageLearningPopup {
             
             if (vocabulary[key]) {
                 vocabulary[key].translation = newTranslation;
+                vocabulary[key].custom = true;
+                vocabulary[key].targetLanguage = this.settings.targetLanguage;
                 await browser.storage.local.set({ vocabulary });
                 
                 // Cache will be updated by background script on next request
